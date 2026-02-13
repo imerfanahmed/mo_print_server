@@ -94,13 +94,43 @@ class PrintServerUI(ctk.CTk):
         pass
 
     def handle_test_print(self):
-        test_data = b"\x1b\x40Test Print Successful\n\n\n\x1d\x56\x00"
+        # ESC/POS Commands
+        ESC = b'\x1b'
+        GS = b'\x1d'
+        
+        # Formatting
+        INIT = ESC + b'@'
+        ALIGN_CENTER = ESC + b'a' + b'\x01'
+        ALIGN_LEFT = ESC + b'a' + b'\x00'
+        BOLD_ON = ESC + b'E' + b'\x01'
+        BOLD_OFF = ESC + b'E' + b'\x00'
+        FONT_B = ESC + b'M' + b'\x01'
+        CUT = GS + b'V' + b'\x42' + b'\x00'
+
+        target_name = self.selected_printer.get() if self.connection_type.get() == "USB/System" else f"{self.ip_entry.get()}:{self.port_entry.get()}"
+
+        test_data = (
+            INIT +
+            ALIGN_CENTER + BOLD_ON + b"RMS Print Server\n" + BOLD_OFF +
+            b"Test Page\n\n" +
+            ALIGN_LEFT +
+            b"--------------------------------\n" +
+            b"Connection: " + self.connection_type.get().encode('utf-8') + b"\n" +
+            b"Target: " + target_name.encode('utf-8') + b"\n" +
+            b"Time: " + self.get_time().encode('utf-8') + b"\n" +
+            b"--------------------------------\n" +
+            ALIGN_CENTER + b"If you can read this,\nprinter setup is successful!\n" +
+            b"\n" + FONT_B + b"(End of Test)\n" +
+            b"\n\n\n\n" + 
+            CUT
+        )
+        
         try:
             if self.connection_type.get() == "USB/System":
                 print_to_windows_spooler(self.selected_printer.get(), test_data)
             else:
                 print_to_network_ip(self.ip_entry.get(), self.port_entry.get(), test_data)
-            self.log(f"Test print sent to {self.connection_type.get()}")
+            self.log(f"Extensive test print sent to {self.connection_type.get()}")
         except Exception as e:
             self.log(f"Error: {e}")
 

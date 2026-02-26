@@ -5,7 +5,8 @@ import json
 import base64
 import socket
 import logging
-import websockets
+import pysher
+import time
 try:
     import win32print
 except ImportError:
@@ -45,21 +46,39 @@ class PrintServerUI(ctk.CTk):
         else:
             self.printers = ["Mock Printer 1", "Mock Printer 2"]
             
-        self.selected_printer = ctk.StringVar(value=self.printers[0] if self.printers else "")
-        self.connection_type = ctk.StringVar(value="USB/System")
+        self.server_config = {}
+        try:
+            import os
+            if os.path.exists("server_config.json"):
+                with open("server_config.json", "r") as f:
+                    self.server_config = json.load(f)
+        except Exception:
+            pass
+
+        default_printer = self.server_config.get("selected_printer", self.printers[0] if self.printers else "")
+        if default_printer not in self.printers and self.printers:
+            default_printer = self.printers[0]
+
+        self.selected_printer = ctk.StringVar(value=default_printer)
+        self.connection_type = ctk.StringVar(value=self.server_config.get("connection_type", "USB/System"))
         
-        # Reverb Config
-        self.reverb_host = ctk.StringVar(value="localhost")
-        self.reverb_port = ctk.StringVar(value="8080")
-        self.reverb_app_key = ctk.StringVar(value="")
-        self.reverb_channel = ctk.StringVar(value="print-channel")
-        self.reverb_scheme = ctk.StringVar(value="ws")
-        self.reverb_connected = False
+        # Pusher Config
+        self.pusher_connected = False
+        self.pusher_client = None
+        self.pusher_config = {}
+        try:
+            import os
+            if os.path.exists("pusher_config.json"):
+                with open("pusher_config.json", "r") as f:
+                    self.pusher_config = json.load(f)
+        except Exception:
+            pass
 
         self.setup_ui()
         
-        # Start Reverb Thread
-        threading.Thread(target=lambda: asyncio.run(self.reverb_listener()), daemon=True).start()
+        # Connect to Pusher if config exists
+        if self.pusher_config.get("key"):
+            self.connect_to_pusher()
 
     def setup_ui(self):
         # Settings Header
@@ -75,33 +94,34 @@ class PrintServerUI(ctk.CTk):
         self.input_frame.pack(pady=5, padx=20, fill="x")
         self.refresh_inputs()
         
-        # Reverb Settings Header
-        ctk.CTkLabel(self, text="Cloud Connection (Reverb)", font=("Arial", 16, "bold")).pack(pady=(15, 5))
+        self.save_printer_btn = ctk.CTkButton(self, text="Save Printer Settings", command=self.save_printer_config)
+        self.save_printer_btn.pack(pady=5)
         
-        # Reverb Config Frame
-        self.reverb_frame = ctk.CTkFrame(self)
-        self.reverb_frame.pack(pady=5, padx=20, fill="x")
+        # Pusher Settings Header
+        ctk.CTkLabel(self, text="Cloud Connection (Pusher)", font=("Arial", 16, "bold")).pack(pady=(15, 5))
         
-        # Host & Port
-        row1 = ctk.CTkFrame(self.reverb_frame, fg_color="transparent")
-        row1.pack(fill="x", padx=5, pady=2)
-        ctk.CTkLabel(row1, text="Host:").pack(side="left", padx=5)
-        ctk.CTkEntry(row1, textvariable=self.reverb_host, width=200).pack(side="left", padx=5)
-        ctk.CTkLabel(row1, text="Port:").pack(side="left", padx=5)
-        ctk.CTkEntry(row1, textvariable=self.reverb_port, width=60).pack(side="left", padx=5)
-        ctk.CTkLabel(row1, text="Scheme:").pack(side="left", padx=5)
-        ctk.CTkOptionMenu(row1, variable=self.reverb_scheme, values=["ws", "wss"], width=70).pack(side="left", padx=5)
+        # Pusher Config Frame
+        self.pusher_frame = ctk.CTkFrame(self)
+        self.pusher_frame.pack(pady=5, padx=20, fill="x")
+        
+        ctk.CTkLabel(self.pusher_frame, text="Paste Pusher Credentials:").pack(anchor="w", padx=5)
+        self.pusher_config_text = ctk.CTkTextbox(self.pusher_frame, height=120)
+        self.pusher_config_text.pack(pady=5, padx=5, fill="x")
+        
+        default_text = (
+            f'app_id = "{self.pusher_config.get("app_id", "")}"\n'
+            f'key = "{self.pusher_config.get("key", "")}"\n'
+            f'secret = "{self.pusher_config.get("secret", "")}"\n'
+            f'cluster = "{self.pusher_config.get("cluster", "eu")}"\n'
+            f'channel = "{self.pusher_config.get("channel", "print-channel")}"'
+        )
+        self.pusher_config_text.insert("0.0", default_text)
 
-        # App Key & Channel
-        row2 = ctk.CTkFrame(self.reverb_frame, fg_color="transparent")
-        row2.pack(fill="x", padx=5, pady=2)
-        ctk.CTkLabel(row2, text="App Key:").pack(side="left", padx=5)
-        ctk.CTkEntry(row2, textvariable=self.reverb_app_key, width=150).pack(side="left", padx=5)
-        ctk.CTkLabel(row2, text="Channel:").pack(side="left", padx=5)
-        ctk.CTkEntry(row2, textvariable=self.reverb_channel, width=150).pack(side="left", padx=5)
+        self.connect_btn = ctk.CTkButton(self.pusher_frame, text="Connect", command=self.save_and_connect_pusher)
+        self.connect_btn.pack(pady=5)
 
-        self.reverb_status_lbl = ctk.CTkLabel(self, text="Status: Disconnected", text_color="red")
-        self.reverb_status_lbl.pack(pady=5)
+        self.pusher_status_lbl = ctk.CTkLabel(self, text="Status: Disconnected", text_color="red")
+        self.pusher_status_lbl.pack(pady=5)
 
         # Log Window
         ctk.CTkLabel(self, text="Activity Log", font=("Arial", 14, "bold")).pack(pady=(10, 0))
@@ -121,13 +141,18 @@ class PrintServerUI(ctk.CTk):
             ctk.CTkLabel(self.input_frame, text="Select Installed Printer:").pack(side="left", padx=5)
             self.p_menu = ctk.CTkOptionMenu(self.input_frame, values=self.printers, variable=self.selected_printer)
             self.p_menu.pack(side="left", padx=5)
+            self.ip_entry = None
+            self.port_entry = None
         else:
             ctk.CTkLabel(self.input_frame, text="IP:").pack(side="left", padx=5)
             self.ip_entry = ctk.CTkEntry(self.input_frame, placeholder_text="192.168.1.100")
             self.ip_entry.pack(side="left", padx=5)
+            if self.server_config.get("network_ip"):
+                self.ip_entry.insert(0, self.server_config.get("network_ip"))
+
             ctk.CTkLabel(self.input_frame, text="Port:").pack(side="left", padx=5)
             self.port_entry = ctk.CTkEntry(self.input_frame, placeholder_text="9100", width=70)
-            self.port_entry.insert(0, "9100")
+            self.port_entry.insert(0, self.server_config.get("network_port", "9100"))
             self.port_entry.pack(side="left", padx=5)
 
     def log(self, message):
@@ -138,108 +163,156 @@ class PrintServerUI(ctk.CTk):
         from datetime import datetime
         return datetime.now().strftime("%H:%M:%S")
 
-    async def reverb_listener(self):
-        while True:
+    def save_printer_config(self):
+        config = {
+            "connection_type": self.connection_type.get(),
+            "selected_printer": self.selected_printer.get()
+        }
+        if self.connection_type.get() == "Network IP":
+            config["network_ip"] = self.ip_entry.get() if self.ip_entry else ""
+            config["network_port"] = self.port_entry.get() if self.port_entry else "9100"
+            
+        self.server_config = config
+        try:
+            with open("server_config.json", "w") as f:
+                json.dump(config, f)
+            self.log("Printer settings saved.")
+        except Exception as e:
+            self.log(f"Error saving printer settings: {e}")
+
+    def save_and_connect_pusher(self):
+        text = self.pusher_config_text.get("0.0", "end").strip()
+        config = {}
+        for line in text.split('\n'):
+            line = line.strip()
+            if '=' in line:
+                k, v = line.split('=', 1)
+                k = k.strip()
+                v = v.strip().strip('",\'')
+                config[k] = v
+        
+        if "channel" not in config:
+            config["channel"] = "print-channel"
+            
+        self.pusher_config = config
+        try:
+            with open("pusher_config.json", "w") as f:
+                json.dump(config, f)
+            self.log("Configuration saved.")
+        except Exception as e:
+            self.log(f"Error saving config: {e}")
+
+        self.connect_to_pusher()
+
+    def connect_to_pusher(self):
+        # Disconnect existing connection if any
+        if self.pusher_client:
             try:
-                # Construct WebSocket URL
-                host = self.reverb_host.get()
-                port = self.reverb_port.get()
-                app_key = self.reverb_app_key.get()
-                scheme = self.reverb_scheme.get()
+                self.pusher_client.disconnect()
+            except:
+                pass
+            self.pusher_client = None
+
+        key = self.pusher_config.get("key")
+        cluster = self.pusher_config.get("cluster", "eu")
+        
+        if not key:
+            self.log("Pusher key missing. Cannot connect.")
+            return
+
+        self.log(f"Initializing Pusher client (Cluster: {cluster})...")
+        self.pusher_client = pysher.Pusher(key, cluster=cluster)
+
+        # Attach connection handler
+        self.pusher_client.connection.bind('pusher:connection_established', self.on_pusher_connected)
+        self.pusher_client.connection.bind('pusher:connection_failed', self.on_pusher_failed)
+        self.pusher_client.connection.bind('pusher:error', self.on_pusher_error)
+
+        self.pusher_client.connect()
+
+    def on_pusher_connected(self, data):
+        self.pusher_connected = True
+        self.pusher_status_lbl.configure(text="Status: Connected", text_color="green")
+        self.log("Connected to Pusher successfully.")
+        
+        channel_name = self.pusher_config.get('channel', 'print-channel')
+        channel = self.pusher_client.subscribe(channel_name)
+        channel.bind('App\\Events\\PrintJobReceived', self.handle_print_event) # Laravel style default event
+        channel.bind('App\\Events\\PrintJobDispatched', self.handle_print_event) 
+        channel.bind('print-event', self.handle_print_event) # Generic event fallback
+        channel.bind('print', self.handle_print_event) # Our actual broadcast name
+        self.log(f"Subscribed to channel: {channel_name}")
+
+    def on_pusher_failed(self, data):
+        self.pusher_connected = False
+        self.pusher_status_lbl.configure(text="Status: Connection Failed", text_color="red")
+        self.log(f"Pusher connection failed: {data}")
+
+    def on_pusher_error(self, data):
+        self.log(f"Pusher Error: {data}")
+
+    def handle_print_event(self, *args, **kwargs):
+        # Pysher passes the event payload as the first argument, typically as a JSON string
+        try:
+            if not args:
+                return
+
+            raw_data = args[0]
+            if isinstance(raw_data, str):
+                payload = json.loads(raw_data)
+            else:
+                payload = raw_data
+
+            content_to_print = None
+            
+            if isinstance(payload, dict):
+                if 'content' in payload:
+                    content_to_print = payload['content']
+                elif 'data' in payload:
+                    content_to_print = payload['data']
+                else:
+                    content_to_print = payload.get('message', '')
+
+            if content_to_print:
+                try:
+                    decoded = base64.b64decode(content_to_print)
+                    content_to_print = decoded
+                except:
+                    if isinstance(content_to_print, str):
+                        content_to_print = content_to_print.encode('utf-8')
+
+                self.log(f"Received print job via Pusher ({len(content_to_print)} bytes)")
                 
-                if not host or not app_key:
-                    await asyncio.sleep(2)
-                    continue
+                # Determine connection and printer from payload if available
+                conn_type = self.connection_type.get()
+                printer_target = self.selected_printer.get()
+                ip_target = self.ip_entry.get() if hasattr(self, 'ip_entry') and self.ip_entry else ""
+                port_target = self.port_entry.get() if hasattr(self, 'port_entry') and self.port_entry else "9100"
 
-                uri = f"{scheme}://{host}:{port}/app/{app_key}?protocol=7&client=python&version=1.0&flash=false"
-                self.log(f"Connecting to Reverb: {uri}")
-                
-                async with websockets.connect(uri) as websocket:
-                    self.reverb_connected = True
-                    self.reverb_status_lbl.configure(text="Status: Connected", text_color="green")
-                    self.log("Connected to Reverb")
+                if isinstance(payload, dict):
+                    if payload.get("connectivity") == "network":
+                        conn_type = "Network IP"
+                        printer_ip = payload.get("printer", "")
+                        if ":" in printer_ip:
+                            ip_target, port_target = printer_ip.split(":", 1)
+                        else:
+                            ip_target = printer_ip
+                    elif payload.get("connectivity") == "usb":
+                        conn_type = "USB/System"
+                        printer_target = payload.get("printer", printer_target)
 
-                    async for message in websocket:
-                        data = json.loads(message)
-                        event = data.get('event')
+                if conn_type == "USB/System":
+                    print_to_windows_spooler(printer_target, content_to_print)
+                else:
+                    if not ip_target:
+                        self.log("Error: Network IP target is empty from both UI and Payload")
+                    else:
+                        print_to_network_ip(ip_target, port_target, content_to_print)
+            else:
+                self.log("Received event but found no printable content")
 
-                        if event == 'pusher:connection_established':
-                            # Subscribe to channel
-                            channel = self.reverb_channel.get()
-                            subscribe_msg = {
-                                "event": "pusher:subscribe",
-                                "data": {"channel": channel}
-                            }
-                            await websocket.send(json.dumps(subscribe_msg))
-                            self.log(f"Subscribed to channel: {channel}")
-
-                        elif event == 'pusher:ping':
-                            await websocket.send(json.dumps({"event": "pusher:pong"}))
-                        
-                        elif event and event not in ['pusher_internal:subscription_succeeded', 'pusher:pong']:
-                            # Handle Print Event
-                            try:
-                                payload = data.get('data', '')
-                                if isinstance(payload, str):
-                                    payload = json.loads(payload)
-                                
-                                # Access raw data assumed to be in 'data' field or direct payload
-                                raw_print_data = None
-                                if 'data' in payload:
-                                     raw_print_data = payload['data']
-                                else:
-                                     # If the payload itself is the data or it's just raw bytes in the event
-                                     pass 
-                                
-                                # For this implementation, let's assume the event data contains 'print_data' 
-                                # or we just take the raw string if it's not JSON
-                                
-                                # Adjustment based on user request "direct raw printing data"
-                                # The event data field from Pusher is a stringified JSON.
-                                # Inside that JSON should be our print content.
-                                # Let's try to extract 'content' or use the whole body if valid.
-                                
-                                content_to_print = None
-                                
-                                # If payload is a dictionary, look for common keys
-                                if isinstance(payload, dict):
-                                    if 'content' in payload:
-                                        content_to_print = payload['content']
-                                    elif 'data' in payload:
-                                        content_to_print = payload['data']
-                                    else:
-                                        # Fallback: dump the whole dict if it looks like raw data? 
-                                        # Or maybe expected base64?
-                                        # Let's assume it's a string in 'data' key for now
-                                        content_to_print = payload.get('message', '')
-
-                                if content_to_print:
-                                    # Decode if base64 (optional safety check)
-                                    try:
-                                        decoded = base64.b64decode(content_to_print)
-                                        content_to_print = decoded
-                                    except:
-                                        pass # Not base64, use as-is (encode to bytes)
-                                        if isinstance(content_to_print, str):
-                                            content_to_print = content_to_print.encode('utf-8')
-
-                                    self.log(f"Received print job via Reverb ({len(content_to_print)} bytes)")
-                                    
-                                    if self.connection_type.get() == "USB/System":
-                                        print_to_windows_spooler(self.selected_printer.get(), content_to_print)
-                                    else:
-                                        print_to_network_ip(self.ip_entry.get(), self.port_entry.get(), content_to_print)
-                                else:
-                                    self.log(f"Received event {event} but found no printable content")
-
-                            except Exception as e:
-                                self.log(f"Error processing Reverb message: {e}")
-
-            except Exception as e:
-                self.reverb_connected = False
-                self.reverb_status_lbl.configure(text="Status: Disconnected", text_color="red")
-                self.log(f"Reverb connection error: {e}. Retrying in 5s...")
-                await asyncio.sleep(5)
+        except Exception as e:
+            self.log(f"Error processing Pusher event: {e}")
 
     def handle_test_print(self):
         # ESC/POS Commands

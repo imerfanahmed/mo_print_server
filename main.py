@@ -7,6 +7,10 @@ import socket
 import logging
 import pysher
 import time
+import sys
+import os
+import winreg
+
 try:
     import win32print
 except ImportError:
@@ -33,6 +37,40 @@ def print_to_network_ip(ip_address, port, raw_data):
         s.connect((ip_address, int(port)))
         s.sendall(raw_data)
 
+def set_autostart(enable=True):
+    key = winreg.HKEY_CURRENT_USER
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    app_name = "RMS Print Server"
+    
+    if getattr(sys, 'frozen', False):
+        exe_path = sys.executable
+    else:
+        exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
+    try:
+        registry_key = winreg.OpenKey(key, key_path, 0, winreg.KEY_SET_VALUE)
+        if enable:
+            winreg.SetValueEx(registry_key, app_name, 0, winreg.REG_SZ, exe_path)
+        else:
+            winreg.DeleteValue(registry_key, app_name)
+        winreg.CloseKey(registry_key)
+        return True
+    except Exception as e:
+        print(f"Autostart Error: {e}")
+        return False
+
+def check_autostart():
+    key = winreg.HKEY_CURRENT_USER
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    app_name = "RMS Print Server"
+    try:
+        registry_key = winreg.OpenKey(key, key_path, 0, winreg.KEY_READ)
+        value, _ = winreg.QueryValueEx(registry_key, app_name)
+        winreg.CloseKey(registry_key)
+        return True
+    except WindowsError:
+        return False
+
 # --- UI Application ---
 class PrintServerUI(ctk.CTk):
     def __init__(self):
@@ -41,10 +79,26 @@ class PrintServerUI(ctk.CTk):
         self.geometry("700x700")
         
         # Configuration Variables
+        self.printers = []
+        self.printer_mapping = {}
         if win32print:
-            self.printers = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)]
+            for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS):
+                printer_name = p[2]
+                display_name = printer_name
+                try:
+                    hprinter = win32print.OpenPrinter(printer_name)
+                    info = win32print.GetPrinter(hprinter, 2)
+                    share_name = info.get('pShareName', '')
+                    win32print.ClosePrinter(hprinter)
+                    if share_name:
+                        display_name = f"{printer_name} ({share_name})"
+                except Exception:
+                    pass
+                self.printers.append(display_name)
+                self.printer_mapping[display_name] = printer_name
         else:
             self.printers = ["Mock Printer 1", "Mock Printer 2"]
+            self.printer_mapping = {p: p for p in self.printers}
             
         self.server_config = {}
         try:
@@ -55,8 +109,14 @@ class PrintServerUI(ctk.CTk):
         except Exception:
             pass
 
-        default_printer = self.server_config.get("selected_printer", self.printers[0] if self.printers else "")
-        if default_printer not in self.printers and self.printers:
+        saved_printer = self.server_config.get("selected_printer", "")
+        default_printer = ""
+        for disp, actual in self.printer_mapping.items():
+            if actual == saved_printer or disp == saved_printer:
+                default_printer = disp
+                break
+        
+        if not default_printer and self.printers:
             default_printer = self.printers[0]
 
         self.selected_printer = ctk.StringVar(value=default_printer)
@@ -122,6 +182,11 @@ class PrintServerUI(ctk.CTk):
 
         self.pusher_status_lbl = ctk.CTkLabel(self, text="Status: Disconnected", text_color="red")
         self.pusher_status_lbl.pack(pady=5)
+        
+        # Autostart Option
+        self.autostart_var = ctk.BooleanVar(value=check_autostart())
+        self.autostart_chk = ctk.CTkCheckBox(self, text="Start Automatically on Windows Boot", variable=self.autostart_var, command=self.toggle_autostart)
+        self.autostart_chk.pack(pady=5)
 
         # Log Window
         ctk.CTkLabel(self, text="Activity Log", font=("Arial", 14, "bold")).pack(pady=(10, 0))
@@ -130,6 +195,60 @@ class PrintServerUI(ctk.CTk):
         
         self.test_btn = ctk.CTkButton(self, text="Send Test Print", fg_color="green", command=self.handle_test_print)
         self.test_btn.pack(pady=10)
+    def get_actual_printer_name(self, display_name):
+        return self.printer_mapping.get(display_name, display_name)
+
+    def handle_test_print(self):
+        # ESC/POS Commands
+        ESC = b'\x1b'
+        GS = b'\x1d'
+        
+        # Formatting
+        INIT = ESC + b'@'
+        ALIGN_CENTER = ESC + b'a' + b'\x01'
+        ALIGN_LEFT = ESC + b'a' + b'\x00'
+        BOLD_ON = ESC + b'E' + b'\x01'
+        BOLD_OFF = ESC + b'E' + b'\x00'
+        FONT_B = ESC + b'M' + b'\x01'
+        CUT = GS + b'V' + b'\x42' + b'\x00'
+
+        target_name = self.selected_printer.get() if self.connection_type.get() == "USB/System" else f"{self.ip_entry.get()}:{self.port_entry.get()}"
+
+        test_data = (
+            INIT +
+            ALIGN_CENTER + BOLD_ON + b"RMS Print Server\n" + BOLD_OFF +
+            b"Test Page\n\n" +
+            ALIGN_LEFT +
+            b"--------------------------------\n" +
+            b"Connection: " + self.connection_type.get().encode('utf-8') + b"\n" +
+            b"Target: " + target_name.encode('utf-8') + b"\n" +
+            b"Time: " + self.get_time().encode('utf-8') + b"\n" +
+            b"--------------------------------\n" +
+            ALIGN_CENTER + b"If you can read this,\nprinter setup is successful!\n" +
+            b"\n" + FONT_B + b"(End of Test)\n" +
+            b"\n\n\n\n" + 
+            CUT
+        )
+        
+        try:
+            if self.connection_type.get() == "USB/System":
+                actual_printer = self.get_actual_printer_name(self.selected_printer.get())
+                print_to_windows_spooler(actual_printer, test_data)
+            else:
+                print_to_network_ip(self.ip_entry.get() if hasattr(self, 'ip_entry') and self.ip_entry else "", self.port_entry.get() if hasattr(self, 'port_entry') and self.port_entry else "9100", test_data)
+            self.log(f"Extensive test print sent to {self.connection_type.get()}")
+        except Exception as e:
+            self.log(f"Error: {e}")
+
+    def toggle_autostart(self):
+        enabled = self.autostart_var.get()
+        success = set_autostart(enabled)
+        if success:
+            state = "enabled" if enabled else "disabled"
+            self.log(f"Auto-startup on boot is now {state}.")
+        else:
+            self.autostart_var.set(not enabled) # Revert UI
+            self.log("Failed to modify Windows Registry for auto-start.")
 
     def toggle_inputs(self, value):
         for widget in self.input_frame.winfo_children():
@@ -166,7 +285,7 @@ class PrintServerUI(ctk.CTk):
     def save_printer_config(self):
         config = {
             "connection_type": self.connection_type.get(),
-            "selected_printer": self.selected_printer.get()
+            "selected_printer": self.get_actual_printer_name(self.selected_printer.get())
         }
         if self.connection_type.get() == "Network IP":
             config["network_ip"] = self.ip_entry.get() if self.ip_entry else ""
@@ -277,11 +396,14 @@ class PrintServerUI(ctk.CTk):
                 try:
                     decoded = base64.b64decode(content_to_print)
                     content_to_print = decoded
+                    
+                    readable_text = ''.join(chr(b) if 32 <= b <= 126 or b == 10 else '' for b in decoded)
+                    self.log(f"Received print job via Pusher ({len(decoded)} bytes)")
+                    self.log(f"--- Decoded Data Preview ---\n{readable_text.strip()}\n----------------------------")
                 except:
                     if isinstance(content_to_print, str):
                         content_to_print = content_to_print.encode('utf-8')
-
-                self.log(f"Received print job via Pusher ({len(content_to_print)} bytes)")
+                    self.log(f"Received print job via Pusher ({len(content_to_print)} bytes)")
                 
                 # Determine connection and printer from payload if available
                 conn_type = self.connection_type.get()
@@ -302,7 +424,8 @@ class PrintServerUI(ctk.CTk):
                         printer_target = payload.get("printer", printer_target)
 
                 if conn_type == "USB/System":
-                    print_to_windows_spooler(printer_target, content_to_print)
+                    actual_printer = self.get_actual_printer_name(printer_target)
+                    print_to_windows_spooler(actual_printer, content_to_print)
                 else:
                     if not ip_target:
                         self.log("Error: Network IP target is empty from both UI and Payload")

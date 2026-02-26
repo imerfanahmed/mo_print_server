@@ -18,6 +18,18 @@ try:
 except ImportError:
     win32print = None
 
+def get_base_path():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def get_config_path(filename):
+    # Determine the AppData directory to store configuration safely 
+    # (since writing to Program Files requires admin rights)
+    appdata_dir = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'MagicOfficeRMS')
+    os.makedirs(appdata_dir, exist_ok=True)
+    return os.path.join(appdata_dir, filename)
+
 # --- Logic for Different Printer Types ---
 def print_to_windows_spooler(printer_name, raw_data):
     if not win32print:
@@ -35,9 +47,16 @@ def print_to_windows_spooler(printer_name, raw_data):
 
 def print_to_network_ip(ip_address, port, raw_data):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(5)
+        s.settimeout(3) # Reduce timeout so config push fails fast if TCP doesn't work
         s.connect((ip_address, int(port)))
         s.sendall(raw_data)
+
+def push_config_udp(ip_address, raw_data):
+    # Many printers have a config UDP port (e.g. 40000, or just broadcast 9100)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.sendto(raw_data, (ip_address, 40000))
+        s.sendto(raw_data, (ip_address, 9100))
 
 def set_autostart(enable=True):
     key = winreg.HKEY_CURRENT_USER
@@ -77,7 +96,7 @@ def check_autostart():
 class PrintServerUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("RMS Cloud Print Gateway")
+        self.title("Magic Office RMS Cloud Print Gateway")
         self.geometry("700x700")
 
         # System Tray Hook
@@ -85,7 +104,7 @@ class PrintServerUI(ctk.CTk):
         self.icon_image = self.create_image()
         self.tray_icon = None
         
-        # Configuration Variables
+        # Discover Printers
         self.printers = []
         self.printer_mapping = {}
         if win32print:
@@ -107,36 +126,18 @@ class PrintServerUI(ctk.CTk):
             self.printers = ["Mock Printer 1", "Mock Printer 2"]
             self.printer_mapping = {p: p for p in self.printers}
             
-        self.server_config = {}
-        try:
-            import os
-            if os.path.exists("server_config.json"):
-                with open("server_config.json", "r") as f:
-                    self.server_config = json.load(f)
-        except Exception:
-            pass
-
-        saved_printer = self.server_config.get("selected_printer", "")
-        default_printer = ""
-        for disp, actual in self.printer_mapping.items():
-            if actual == saved_printer or disp == saved_printer:
-                default_printer = disp
-                break
-        
-        if not default_printer and self.printers:
-            default_printer = self.printers[0]
-
+        default_printer = self.printers[0] if self.printers else ""
         self.selected_printer = ctk.StringVar(value=default_printer)
-        self.connection_type = ctk.StringVar(value=self.server_config.get("connection_type", "USB/System"))
+        self.connection_type = ctk.StringVar(value="USB/System")
         
         # Pusher Config
         self.pusher_connected = False
         self.pusher_client = None
         self.pusher_config = {}
         try:
-            import os
-            if os.path.exists("pusher_config.json"):
-                with open("pusher_config.json", "r") as f:
+            config_path = get_config_path("pusher_config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
                     self.pusher_config = json.load(f)
         except Exception:
             pass
@@ -148,27 +149,18 @@ class PrintServerUI(ctk.CTk):
             self.connect_to_pusher()
 
     def setup_ui(self):
-        # Settings Header
-        ctk.CTkLabel(self, text="Printer Settings", font=("Arial", 16, "bold")).pack(pady=(10, 5))
+        # Setup Tabs
+        self.tabview = ctk.CTkTabview(self, height=350)
+        self.tabview.pack(padx=20, pady=10, fill="x")
 
-        # Connection Type Toggle
-        self.type_menu = ctk.CTkSegmentedButton(self, values=["USB/System", "Network IP"], 
-                                                variable=self.connection_type, command=self.toggle_inputs)
-        self.type_menu.pack(pady=5)
+        self.tab_config = self.tabview.add("Print Server Config")
+        self.tab_test = self.tabview.add("Test Print")
+        # self.tab_network = self.tabview.add("Network Config")
 
-        # Printer Config Frame
-        self.input_frame = ctk.CTkFrame(self)
-        self.input_frame.pack(pady=5, padx=20, fill="x")
-        self.refresh_inputs()
+        # --- Print Server Config Tab ---
+        ctk.CTkLabel(self.tab_config, text="Cloud Connection (Pusher)", font=("Arial", 16, "bold")).pack(pady=(10, 5))
         
-        self.save_printer_btn = ctk.CTkButton(self, text="Save Printer Settings", command=self.save_printer_config)
-        self.save_printer_btn.pack(pady=5)
-        
-        # Pusher Settings Header
-        ctk.CTkLabel(self, text="Cloud Connection (Pusher)", font=("Arial", 16, "bold")).pack(pady=(15, 5))
-        
-        # Pusher Config Frame
-        self.pusher_frame = ctk.CTkFrame(self)
+        self.pusher_frame = ctk.CTkFrame(self.tab_config)
         self.pusher_frame.pack(pady=5, padx=20, fill="x")
         
         ctk.CTkLabel(self.pusher_frame, text="Paste Pusher Credentials:").pack(anchor="w", padx=5)
@@ -184,68 +176,68 @@ class PrintServerUI(ctk.CTk):
         )
         self.pusher_config_text.insert("0.0", default_text)
 
-        self.connect_btn = ctk.CTkButton(self.pusher_frame, text="Connect", command=self.save_and_connect_pusher)
+        self.connect_btn = ctk.CTkButton(self.pusher_frame, text="Save & Connect", command=self.save_and_connect_pusher)
         self.connect_btn.pack(pady=5)
 
-        self.pusher_status_lbl = ctk.CTkLabel(self, text="Status: Disconnected", text_color="red")
+        self.pusher_status_lbl = ctk.CTkLabel(self.tab_config, text="Status: Disconnected", text_color="red")
         self.pusher_status_lbl.pack(pady=5)
         
-        # Autostart Option
         self.autostart_var = ctk.BooleanVar(value=check_autostart())
-        self.autostart_chk = ctk.CTkCheckBox(self, text="Start Automatically on Windows Boot", variable=self.autostart_var, command=self.toggle_autostart)
-        self.autostart_chk.pack(pady=5)
+        self.autostart_chk = ctk.CTkCheckBox(self.tab_config, text="Start Automatically on Windows Boot", variable=self.autostart_var, command=self.toggle_autostart)
+        self.autostart_chk.pack(pady=10)
 
-        # Log Window
-        ctk.CTkLabel(self, text="Activity Log", font=("Arial", 14, "bold")).pack(pady=(10, 0))
-        self.log_text = ctk.CTkTextbox(self, height=150)
-        self.log_text.pack(pady=5, padx=20, fill="both", expand=True)
+        # --- Test Print Tab ---
+        ctk.CTkLabel(self.tab_test, text="Test Printer Connectivity", font=("Arial", 16, "bold")).pack(pady=(10, 5))
+
+        self.type_menu = ctk.CTkSegmentedButton(self.tab_test, values=["USB/System", "Network IP"], 
+                                                variable=self.connection_type, command=self.toggle_inputs)
+        self.type_menu.pack(pady=10)
+
+        self.input_frame = ctk.CTkFrame(self.tab_test)
+        self.input_frame.pack(pady=10, padx=20, fill="x")
         
-        self.test_btn = ctk.CTkButton(self, text="Send Test Print", fg_color="green", command=self.handle_test_print)
-        self.test_btn.pack(pady=10)
+        self.test_btn = ctk.CTkButton(self.tab_test, text="Send Test Print", fg_color="green", command=self.handle_test_print)
+        self.test_btn.pack(pady=15)
+        
+        self.refresh_inputs()
+
+        # # --- Network Config Tab ---
+        # ctk.CTkLabel(self.tab_network, text="Push Network Configuration", font=("Arial", 16, "bold")).pack(pady=(10, 5))
+        # ctk.CTkLabel(self.tab_network, text="Warning: This works on most generic ESC/POS network printers.\nThe printer will restart automatically after sending.", text_color="orange").pack(pady=5)
+        # 
+        # net_frame = ctk.CTkFrame(self.tab_network)
+        # net_frame.pack(pady=10, padx=20, fill="x")
+
+        # # Current Connection
+        # ctk.CTkLabel(net_frame, text="Current IP (to connect to):").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        # self.net_current_ip = ctk.CTkEntry(net_frame, placeholder_text="192.168.1.100")
+        # self.net_current_ip.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+
+        # # New Configuration
+        # ctk.CTkLabel(net_frame, text="New IP Address:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        # self.net_new_ip = ctk.CTkEntry(net_frame, placeholder_text="192.168.1.200")
+        # self.net_new_ip.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+
+        # ctk.CTkLabel(net_frame, text="Subnet Mask:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        # self.net_mask = ctk.CTkEntry(net_frame, placeholder_text="255.255.255.0")
+        # self.net_mask.insert(0, "255.255.255.0")
+        # self.net_mask.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+
+        # ctk.CTkLabel(net_frame, text="Gateway:").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+        # self.net_gateway = ctk.CTkEntry(net_frame, placeholder_text="192.168.1.1")
+        # self.net_gateway.insert(0, "192.168.1.1")
+        # self.net_gateway.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+
+        # self.net_push_btn = ctk.CTkButton(self.tab_network, text="Push Configuration to Printer", fg_color="red", command=self.handle_network_config_push)
+        # self.net_push_btn.pack(pady=15)
+
+        # --- Shared Log Window ---
+        ctk.CTkLabel(self, text="Activity Log", font=("Arial", 14, "bold")).pack(pady=(10, 0))
+        self.log_text = ctk.CTkTextbox(self)
+        self.log_text.pack(pady=(5, 20), padx=20, fill="both", expand=True)
+
     def get_actual_printer_name(self, display_name):
         return self.printer_mapping.get(display_name, display_name)
-
-    def handle_test_print(self):
-        # ESC/POS Commands
-        ESC = b'\x1b'
-        GS = b'\x1d'
-        
-        # Formatting
-        INIT = ESC + b'@'
-        ALIGN_CENTER = ESC + b'a' + b'\x01'
-        ALIGN_LEFT = ESC + b'a' + b'\x00'
-        BOLD_ON = ESC + b'E' + b'\x01'
-        BOLD_OFF = ESC + b'E' + b'\x00'
-        FONT_B = ESC + b'M' + b'\x01'
-        CUT = GS + b'V' + b'\x42' + b'\x00'
-
-        target_name = self.selected_printer.get() if self.connection_type.get() == "USB/System" else f"{self.ip_entry.get()}:{self.port_entry.get()}"
-
-        test_data = (
-            INIT +
-            ALIGN_CENTER + BOLD_ON + b"RMS Print Server\n" + BOLD_OFF +
-            b"Test Page\n\n" +
-            ALIGN_LEFT +
-            b"--------------------------------\n" +
-            b"Connection: " + self.connection_type.get().encode('utf-8') + b"\n" +
-            b"Target: " + target_name.encode('utf-8') + b"\n" +
-            b"Time: " + self.get_time().encode('utf-8') + b"\n" +
-            b"--------------------------------\n" +
-            ALIGN_CENTER + b"If you can read this,\nprinter setup is successful!\n" +
-            b"\n" + FONT_B + b"(End of Test)\n" +
-            b"\n\n\n\n" + 
-            CUT
-        )
-        
-        try:
-            if self.connection_type.get() == "USB/System":
-                actual_printer = self.get_actual_printer_name(self.selected_printer.get())
-                print_to_windows_spooler(actual_printer, test_data)
-            else:
-                print_to_network_ip(self.ip_entry.get() if hasattr(self, 'ip_entry') and self.ip_entry else "", self.port_entry.get() if hasattr(self, 'port_entry') and self.port_entry else "9100", test_data)
-            self.log(f"Extensive test print sent to {self.connection_type.get()}")
-        except Exception as e:
-            self.log(f"Error: {e}")
 
     def toggle_autostart(self):
         enabled = self.autostart_var.get()
@@ -273,12 +265,10 @@ class PrintServerUI(ctk.CTk):
             ctk.CTkLabel(self.input_frame, text="IP:").pack(side="left", padx=5)
             self.ip_entry = ctk.CTkEntry(self.input_frame, placeholder_text="192.168.1.100")
             self.ip_entry.pack(side="left", padx=5)
-            if self.server_config.get("network_ip"):
-                self.ip_entry.insert(0, self.server_config.get("network_ip"))
 
             ctk.CTkLabel(self.input_frame, text="Port:").pack(side="left", padx=5)
             self.port_entry = ctk.CTkEntry(self.input_frame, placeholder_text="9100", width=70)
-            self.port_entry.insert(0, self.server_config.get("network_port", "9100"))
+            self.port_entry.insert(0, "9100")
             self.port_entry.pack(side="left", padx=5)
 
     def log(self, message):
@@ -288,23 +278,6 @@ class PrintServerUI(ctk.CTk):
     def get_time(self):
         from datetime import datetime
         return datetime.now().strftime("%H:%M:%S")
-
-    def save_printer_config(self):
-        config = {
-            "connection_type": self.connection_type.get(),
-            "selected_printer": self.get_actual_printer_name(self.selected_printer.get())
-        }
-        if self.connection_type.get() == "Network IP":
-            config["network_ip"] = self.ip_entry.get() if self.ip_entry else ""
-            config["network_port"] = self.port_entry.get() if self.port_entry else "9100"
-            
-        self.server_config = config
-        try:
-            with open("server_config.json", "w") as f:
-                json.dump(config, f)
-            self.log("Printer settings saved.")
-        except Exception as e:
-            self.log(f"Error saving printer settings: {e}")
 
     def save_and_connect_pusher(self):
         text = self.pusher_config_text.get("0.0", "end").strip()
@@ -322,7 +295,7 @@ class PrintServerUI(ctk.CTk):
             
         self.pusher_config = config
         try:
-            with open("pusher_config.json", "w") as f:
+            with open(get_config_path("pusher_config.json"), "w") as f:
                 json.dump(config, f)
             self.log("Configuration saved.")
         except Exception as e:
@@ -389,6 +362,20 @@ class PrintServerUI(ctk.CTk):
             else:
                 payload = raw_data
 
+            # --- LOG THE FULL PAYLOAD EVENT ---
+            self.log(f"--- INCOMING EVENT FROM PUSHER ---")
+            
+            # Use json.dumps to pretty print the incoming mapping and identifiers
+            if isinstance(payload, dict):
+                # We filter out the raw content string to keep logs readable, but show everything else!
+                log_payload = {k: v for k, v in payload.items() if k not in ['content', 'data', 'message']}
+                if 'content' in payload or 'data' in payload:
+                    log_payload['content'] = "[...base64 content truncated for log readability...]"
+                self.log(json.dumps(log_payload, indent=2))
+            else:
+                self.log(str(payload))
+            self.log("----------------------------------")
+
             content_to_print = None
             
             if isinstance(payload, dict):
@@ -412,34 +399,31 @@ class PrintServerUI(ctk.CTk):
                         content_to_print = content_to_print.encode('utf-8')
                     self.log(f"Received print job via Pusher ({len(content_to_print)} bytes)")
                 
-                # Determine connection and printer from payload if available
-                conn_type = self.connection_type.get()
-                printer_target = self.selected_printer.get()
-                ip_target = self.ip_entry.get() if hasattr(self, 'ip_entry') and self.ip_entry else ""
-                port_target = self.port_entry.get() if hasattr(self, 'port_entry') and self.port_entry else "9100"
-
+                # Determine connection and printer from payload
                 if isinstance(payload, dict):
-                    if payload.get("connectivity") == "network":
-                        conn_type = "Network IP"
-                        printer_ip = payload.get("printer", "")
-                        if ":" in printer_ip:
-                            ip_target, port_target = printer_ip.split(":", 1)
-                        else:
-                            ip_target = printer_ip
-                    elif payload.get("connectivity") == "usb":
-                        conn_type = "USB/System"
-                        printer_target = payload.get("printer", printer_target)
+                    conn_type = payload.get("connectivity")
+                    printer_target = payload.get("printer")
 
-                if conn_type == "USB/System":
-                    actual_printer = self.get_actual_printer_name(printer_target)
-                    print_to_windows_spooler(actual_printer, content_to_print)
-                else:
-                    if not ip_target:
-                        self.log("Error: Network IP target is empty from both UI and Payload")
-                    else:
+                    self.log(f"Routing to -> Connection: {conn_type}, Target: {printer_target}")
+
+                    if conn_type == "network" and printer_target:
+                        if ":" in printer_target:
+                            ip_target, port_target = printer_target.split(":", 1)
+                        else:
+                            ip_target = printer_target
+                            port_target = "9100"
                         print_to_network_ip(ip_target, port_target, content_to_print)
+                        self.log(f"Success: Print job sent to network printer: {printer_target}")
+                    elif conn_type == "usb" and printer_target:
+                        actual_printer = self.get_actual_printer_name(printer_target)
+                        print_to_windows_spooler(actual_printer, content_to_print)
+                        self.log(f"Success: Print job sent to USB/System printer: {actual_printer}")
+                    else:
+                        self.log(f"Error: Invalid payload format or missing destination. Connectivity: '{conn_type}', Printer: '{printer_target}'")
+                else:
+                    self.log("Error: Payload is not a dictionary. Cannot determine printer destination.")
             else:
-                self.log("Received event but found no printable content")
+                self.log("Error: Received event but found no printable content")
 
         except Exception as e:
             self.log(f"Error processing Pusher event: {e}")
@@ -451,39 +435,168 @@ class PrintServerUI(ctk.CTk):
         
         # Formatting
         INIT = ESC + b'@'
+        SET_80MM_WIDTH = GS + b'W' + b'\x80\x02'  # Set print area width: 576 dots (80mm standard)
         ALIGN_CENTER = ESC + b'a' + b'\x01'
         ALIGN_LEFT = ESC + b'a' + b'\x00'
+        ALIGN_RIGHT = ESC + b'a' + b'\x02'
         BOLD_ON = ESC + b'E' + b'\x01'
         BOLD_OFF = ESC + b'E' + b'\x00'
+        FONT_A = ESC + b'M' + b'\x00'
         FONT_B = ESC + b'M' + b'\x01'
+        DOUBLE_HEIGHT = ESC + b'!' + b'\x10'
+        DOUBLE_WIDTH = ESC + b'!' + b'\x20'
+        DOUBLE_HW = ESC + b'!' + b'\x30'
+        NORMAL_TEXT = ESC + b'!' + b'\x00'
+        INVERT_ON = GS + b'B' + b'\x01'
+        INVERT_OFF = GS + b'B' + b'\x00'
         CUT = GS + b'V' + b'\x42' + b'\x00'
 
-        target_name = self.selected_printer.get() if self.connection_type.get() == "USB/System" else f"{self.ip_entry.get()}:{self.port_entry.get()}"
+        conn_type = self.connection_type.get()
+        if conn_type == "USB/System":
+            target_name = self.selected_printer.get()
+        else:
+            ip = self.ip_entry.get() if hasattr(self, 'ip_entry') and self.ip_entry else ""
+            port = self.port_entry.get() if hasattr(self, 'port_entry') and self.port_entry else "9100"
+            target_name = f"{ip}:{port}"
+
+        # ASCII Character Map generator
+        chars = "".join(chr(i) for i in range(33, 127))
+        char_map = b""
+        for i in range(0, len(chars), 32):
+            char_map += chars[i:i+32].encode('ascii') + b"\n"
+
+        # Generate a sample 200x200 pixel test logo image (A hollow square with an X)
+        img_size = 200
+        from PIL import Image, ImageDraw
+        test_img = Image.new('1', (img_size, img_size), 1) # 1-bit monochrome, white background
+        draw = ImageDraw.Draw(test_img)
+        draw.rectangle([10, 10, img_size-10, img_size-10], outline=0, width=5)
+        draw.line([10, 10, img_size-10, img_size-10], fill=0, width=5)
+        draw.line([img_size-10, 10, 10, img_size-10], fill=0, width=5)
+        
+        # Convert PIL Image to ESC/POS Raster Bit Image format (GS v 0)
+        img_bytes = test_img.tobytes()
+        width_bytes = img_size // 8
+        height_dots = img_size
+        
+        # GS v 0 p (Normal mode) xL xH yL yH [data...]
+        IMG_CMD = GS + b'v0' + b'\x00' + \
+                  bytes([width_bytes % 256, width_bytes // 256]) + \
+                  bytes([height_dots % 256, height_dots // 256]) + \
+                  img_bytes
+
+        # Print the printer's internal self-test page
+        # Command varies by manufacturer, but these cover 95% of Chinese clones
+        # (Epson often uses GS ( A ) 
+        SELF_TEST = GS + b'(' + b'A' + b'\x02' + b'\x00' + b'\x00' + b'\x02' # GS ( A standard self test
+        SELF_TEST_NETWORK = GS + b'\x28' + b'\x45' + b'\x02' + b'\x00' + b'\x01' + b'\x49' # Network info self test
 
         test_data = (
-            INIT +
-            ALIGN_CENTER + BOLD_ON + b"RMS Print Server\n" + BOLD_OFF +
-            b"Test Page\n\n" +
-            ALIGN_LEFT +
+            INIT + SET_80MM_WIDTH +
+            ALIGN_CENTER + INVERT_ON + b"   MAGIC OFFICE RMS SELF-TEST   \n" + INVERT_OFF + b"\n" +
+            ALIGN_LEFT + NORMAL_TEXT +
+            b"Printer Diagnostics & Configuration\n" +
             b"--------------------------------\n" +
-            b"Connection: " + self.connection_type.get().encode('utf-8') + b"\n" +
             b"Target: " + target_name.encode('utf-8') + b"\n" +
+            b"Connection: " + conn_type.encode('utf-8') + b"\n" +
             b"Time: " + self.get_time().encode('utf-8') + b"\n" +
+            b"--------------------------------\n\n" +
+            ALIGN_CENTER + BOLD_ON + b"--- IMAGE TEST (200x200) ---\n" + BOLD_OFF +
+            IMG_CMD + b"\n\n" +
+            ALIGN_CENTER + BOLD_ON + b"--- TEXT FORMATTING ---\n" + BOLD_OFF + ALIGN_LEFT +
+            NORMAL_TEXT + b"Normal Text\n" +
+            FONT_B + b"Font B (Small Text)\n" + FONT_A +
+            BOLD_ON + b"Bold Text\n" + BOLD_OFF +
+            DOUBLE_HEIGHT + b"Double Height\n" + NORMAL_TEXT +
+            DOUBLE_WIDTH + b"Double Width\n" + NORMAL_TEXT +
+            DOUBLE_HW + b"Double Size\n" + NORMAL_TEXT +
+            b"\n" + 
+            ALIGN_CENTER + BOLD_ON + b"--- ALIGNMENT ---\n" + BOLD_OFF +
+            ALIGN_LEFT + b"Left Aligned\n" +
+            ALIGN_CENTER + b"Center Aligned\n" +
+            ALIGN_RIGHT + b"Right Aligned\n" + ALIGN_LEFT + b"\n" +
+            ALIGN_CENTER + BOLD_ON + b"--- CHARACTER SET ---\n" + BOLD_OFF + ALIGN_LEFT + FONT_B +
+            char_map + NORMAL_TEXT + b"\n" +
+            ALIGN_CENTER + BOLD_ON + b"--- BARCODE TEST ---\n" + BOLD_OFF +
+            # CODE39 barcode
+            GS + b'h' + chr(80).encode('ascii') + # Height 80
+            GS + b'w' + chr(2).encode('ascii') + # Width 2
+            GS + b'f' + chr(0).encode('ascii') + # Font for HRI
+            GS + b'H' + chr(2).encode('ascii') + # HRI position: Below barcode
+            GS + b'k' + b'\x04' + b'RMS-1234\x00' + # Print Barcode CODE39 (format 4 handles standard code39 well)
+            b"\n\n\n" +
             b"--------------------------------\n" +
-            ALIGN_CENTER + b"If you can read this,\nprinter setup is successful!\n" +
-            b"\n" + FONT_B + b"(End of Test)\n" +
-            b"\n\n\n\n" + 
-            CUT
+            ALIGN_CENTER + DOUBLE_HEIGHT + b"TEST COMPLETED\n" + NORMAL_TEXT +
+            b"--------------------------------\n\n\n\n\n" +
+            CUT + 
+            # Send hardware self-test commands directly after the cut
+            SELF_TEST + SELF_TEST_NETWORK
         )
         
         try:
-            if self.connection_type.get() == "USB/System":
-                print_to_windows_spooler(self.selected_printer.get(), test_data)
+            if conn_type == "USB/System":
+                actual_printer = self.get_actual_printer_name(self.selected_printer.get())
+                print_to_windows_spooler(actual_printer, test_data)
             else:
-                print_to_network_ip(self.ip_entry.get(), self.port_entry.get(), test_data)
-            self.log(f"Extensive test print sent to {self.connection_type.get()}")
+                print_to_network_ip(self.ip_entry.get() if self.ip_entry else "", self.port_entry.get() if self.port_entry else "9100", test_data)
+            self.log(f"Extensive test print sent to {conn_type}")
         except Exception as e:
             self.log(f"Error: {e}")
+
+    # def handle_network_config_push(self):
+    #     current_ip = self.net_current_ip.get().strip()
+    #     new_ip = self.net_new_ip.get().strip()
+    #     mask = self.net_mask.get().strip()
+    #     gateway = self.net_gateway.get().strip()
+    # 
+    #     if not current_ip or not new_ip or not mask or not gateway:
+    #         self.log("Error: All fields are required to push network config.")
+    #         return
+    # 
+    #     def ip_to_bytes(ip_str):
+    #         try:
+    #             return bytes(map(int, ip_str.split('.')))
+    #         except:
+    #             return b'\x00\x00\x00\x00'
+    # 
+    #     new_ip_b = ip_to_bytes(new_ip)
+    #     mask_b = ip_to_bytes(mask)
+    #     gateway_b = ip_to_bytes(gateway)
+    # 
+    #     # ESC/POS Network Config Commands (Standard GS ( E )
+    #     GS = b'\x1d'
+    #     
+    #     # 1. Start Network Config mode
+    #     # Function 112: GS ( E pL pH fn [parameter1] [parameter2]...
+    #     CMD_IP = GS + b'(' + b'E' + b'\x06' + b'\x00' + b'\x70' + b'\x01' + new_ip_b
+    #     CMD_MASK = GS + b'(' + b'E' + b'\x06' + b'\x00' + b'\x70' + b'\x02' + mask_b
+    #     CMD_GATEWAY = GS + b'(' + b'E' + b'\x06' + b'\x00' + b'\x70' + b'\x03' + gateway_b
+    #     CMD_APPLY = GS + b'(' + b'E' + b'\x03' + b'\x00' + b'\x71' + b'\x01' + b'\x00' # Function 113: Apply config
+    # 
+    #     # Alternate vendor commands (e.g., specific Chinese models)
+    #     ALT_IP = b'\x1F\x1B\x1F\x91\x00\x04\x01' + new_ip_b
+    #     ALT_MASK = b'\x1F\x1B\x1F\x91\x00\x04\x02' + mask_b
+    #     ALT_GATEWAY = b'\x1F\x1B\x1F\x91\x00\x04\x03' + gateway_b
+    # 
+    #     config_payload = (
+    #         CMD_IP + CMD_MASK + CMD_GATEWAY + CMD_APPLY + 
+    #         ALT_IP + ALT_MASK + ALT_GATEWAY
+    #     )
+    # 
+    #     self.log(f"Connecting to {current_ip} to push new IP: {new_ip}...")
+    #     try:
+    #         # Try TCP 9100 first
+    #         print_to_network_ip(current_ip, "9100", config_payload)
+    #         self.log(f"Success (TCP): Configuration sent! The printer ({new_ip}) should beep and restart in 3 seconds.")
+    #     except Exception as e:
+    #         self.log(f"TCP connection failed ({e}). Attempting UDP broadcast fallback...")
+    #         try:
+    #             # If TCP times out (common if subnet is entirely different), attempt UDP blast
+    #             push_config_udp('255.255.255.255', config_payload) # Full broadcast mode
+    #             push_config_udp(current_ip, config_payload) # Targeted UDP mode
+    #             self.log(f"Success (UDP): Broadcast pushed. Check if printer ({new_ip}) restarts.")
+    #         except Exception as e2:
+    #             self.log(f"Fatal Error: Could not push via TCP or UDP. {e2}")
 
     # --- System Tray Integration ---
     def create_image(self):

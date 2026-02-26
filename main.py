@@ -10,6 +10,8 @@ import time
 import sys
 import os
 import winreg
+import pystray
+from PIL import Image, ImageDraw
 
 try:
     import win32print
@@ -43,9 +45,9 @@ def set_autostart(enable=True):
     app_name = "RMS Print Server"
     
     if getattr(sys, 'frozen', False):
-        exe_path = sys.executable
+        exe_path = f'"{sys.executable}" --hide'
     else:
-        exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+        exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}" --hide'
 
     try:
         registry_key = winreg.OpenKey(key, key_path, 0, winreg.KEY_SET_VALUE)
@@ -77,6 +79,11 @@ class PrintServerUI(ctk.CTk):
         super().__init__()
         self.title("RMS Cloud Print Gateway")
         self.geometry("700x700")
+
+        # System Tray Hook
+        self.protocol('WM_DELETE_WINDOW', self.withdraw_window)
+        self.icon_image = self.create_image()
+        self.tray_icon = None
         
         # Configuration Variables
         self.printers = []
@@ -478,6 +485,43 @@ class PrintServerUI(ctk.CTk):
         except Exception as e:
             self.log(f"Error: {e}")
 
+    # --- System Tray Integration ---
+    def create_image(self):
+        # Create a simple icon image for the system tray
+        image = Image.new('RGB', (64, 64), color=(0, 120, 215))
+        d = ImageDraw.Draw(image)
+        d.text((10, 20), "RMS", fill=(255, 255, 255))
+        return image
+
+    def withdraw_window(self):
+        self.withdraw()
+        if not self.tray_icon:
+            menu = (
+                pystray.MenuItem('Show Settings', self.show_window, default=True),
+                pystray.MenuItem('Quit Server', self.quit_window)
+            )
+            self.tray_icon = pystray.Icon("name", self.icon_image, "RMS Print Server", menu)
+            import threading
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def show_window(self, icon, item):
+        icon.stop()
+        self.tray_icon = None
+        self.after(0, self.deiconify)
+
+    def quit_window(self, icon, item):
+        icon.stop()
+        if self.pusher_client:
+            try:
+                self.pusher_client.disconnect()
+            except:
+                pass
+        self.destroy()
+
 if __name__ == "__main__":
     app = PrintServerUI()
+    # Trigger withdraw instantly if start-on-boot is set and it was launched automatically,
+    # but for simplicity we will just let it open by default unless we detect a flag.
+    if len(sys.argv) > 1 and sys.argv[1] == "--hide":
+        app.withdraw_window()
     app.mainloop()

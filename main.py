@@ -406,7 +406,7 @@ class PrintServerUI(ctk.CTk):
 
                     self.log(f"Routing to -> Connection: {conn_type}, Target: {printer_target}")
 
-                    if conn_type == "network" and printer_target:
+                    if conn_type in ("network", "ip") and printer_target:
                         if ":" in printer_target:
                             ip_target, port_target = printer_target.split(":", 1)
                         else:

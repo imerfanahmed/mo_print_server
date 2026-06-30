@@ -142,6 +142,17 @@ class PrintServerUI(ctk.CTk):
         except Exception:
             pass
 
+        # Buzzer Config
+        self.buzzer_enabled = ctk.BooleanVar(value=True)
+        try:
+            buzzer_config_path = get_config_path("buzzer_config.json")
+            if os.path.exists(buzzer_config_path):
+                with open(buzzer_config_path, "r") as f:
+                    buzzer_data = json.load(f)
+                    self.buzzer_enabled.set(buzzer_data.get("enabled", True))
+        except Exception:
+            pass
+
         self.setup_ui()
         
         # Connect to Pusher if config exists
@@ -184,7 +195,17 @@ class PrintServerUI(ctk.CTk):
         
         self.autostart_var = ctk.BooleanVar(value=check_autostart())
         self.autostart_chk = ctk.CTkCheckBox(self.tab_config, text="Start Automatically on Windows Boot", variable=self.autostart_var, command=self.toggle_autostart)
-        self.autostart_chk.pack(pady=10)
+        self.autostart_chk.pack(pady=5)
+
+        # --- Buzzer / Drawer Settings ---
+        self.buzzer_frame = ctk.CTkFrame(self.tab_config)
+        self.buzzer_frame.pack(pady=10, padx=20, fill="x")
+        
+        self.buzzer_chk = ctk.CTkCheckBox(self.buzzer_frame, text="Enable Buzzer (Cash Drawer Port)", variable=self.buzzer_enabled, command=self.save_buzzer_config)
+        self.buzzer_chk.pack(side="left", padx=15, pady=10)
+        
+        self.test_buzzer_btn = ctk.CTkButton(self.buzzer_frame, text="Test Buzzer", width=100, command=self.handle_test_buzzer)
+        self.test_buzzer_btn.pack(side="right", padx=15, pady=10)
 
         # --- Test Print Tab ---
         ctk.CTkLabel(self.tab_test, text="Test Printer Connectivity", font=("Arial", 16, "bold")).pack(pady=(10, 5))
@@ -303,6 +324,50 @@ class PrintServerUI(ctk.CTk):
 
         self.connect_to_pusher()
 
+    def save_buzzer_config(self):
+        config = {
+            "enabled": self.buzzer_enabled.get()
+        }
+        try:
+            config_path = get_config_path("buzzer_config.json")
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+            self.log(f"Buzzer setting updated (Enabled: {config['enabled']})")
+        except Exception as e:
+            self.log(f"Error saving buzzer config: {e}")
+
+    def get_buzzer_command(self):
+        # ESC p m t1 t2
+        # We send to both pin 2 (m=0) and pin 5 (m=1) to ensure the connected buzzer sounds
+        # Pulse: 50ms on (25 * 2ms), 500ms off (250 * 2ms)
+        pin2_pulse = b'\x1b\x70\x00\x19\xfa'
+        pin5_pulse = b'\x1b\x70\x01\x19\xfa'
+        return pin2_pulse + pin5_pulse
+
+    def handle_test_buzzer(self):
+        buzzer_cmd = self.get_buzzer_command()
+        conn_type = self.connection_type.get()
+        
+        try:
+            if conn_type == "USB/System":
+                target_printer = self.selected_printer.get()
+                if not target_printer:
+                    self.log("Error: No printer selected.")
+                    return
+                actual_printer = self.get_actual_printer_name(target_printer)
+                print_to_windows_spooler(actual_printer, buzzer_cmd)
+                self.log(f"Sent cash drawer pulse (Buzzer) to USB printer: {actual_printer}")
+            else:
+                ip = self.ip_entry.get().strip() if hasattr(self, 'ip_entry') and self.ip_entry else ""
+                port = self.port_entry.get().strip() if hasattr(self, 'port_entry') and self.port_entry else "9100"
+                if not ip:
+                    self.log("Error: IP address is required to test network buzzer.")
+                    return
+                print_to_network_ip(ip, port, buzzer_cmd)
+                self.log(f"Sent cash drawer pulse (Buzzer) to network printer: {ip}:{port}")
+        except Exception as e:
+            self.log(f"Error testing buzzer: {e}")
+
     def connect_to_pusher(self):
         # Disconnect existing connection if any
         if self.pusher_client:
@@ -398,6 +463,12 @@ class PrintServerUI(ctk.CTk):
                     if isinstance(content_to_print, str):
                         content_to_print = content_to_print.encode('utf-8')
                     self.log(f"Received print job via Pusher ({len(content_to_print)} bytes)")
+                
+                # Append buzzer command if enabled
+                if self.buzzer_enabled.get():
+                    buzzer_cmd = self.get_buzzer_command()
+                    content_to_print += buzzer_cmd
+                    self.log("Appended cash drawer port buzzer pulse to payload.")
                 
                 # Determine connection and printer from payload
                 if isinstance(payload, dict):
@@ -532,6 +603,11 @@ class PrintServerUI(ctk.CTk):
             # Send hardware self-test commands directly after the cut
             SELF_TEST + SELF_TEST_NETWORK
         )
+        
+        # Append buzzer command if enabled
+        if self.buzzer_enabled.get():
+            test_data += self.get_buzzer_command()
+            self.log("Appended cash drawer port buzzer pulse to test print payload.")
         
         try:
             if conn_type == "USB/System":

@@ -427,6 +427,12 @@ class PrintServerUI(ctk.CTk):
             else:
                 payload = raw_data
 
+            # If the payload is wrapped in a Pusher event structure, unwrap the inner data
+            if isinstance(payload, dict) and 'data' in payload and isinstance(payload['data'], dict):
+                inner = payload['data']
+                if 'printer' in inner or 'connectivity' in inner or 'payload_url' in inner or 'is_v2' in inner:
+                    payload = inner
+
             # --- LOG THE FULL PAYLOAD EVENT ---
             self.log(f"--- INCOMING EVENT FROM PUSHER ---")
             
@@ -442,14 +448,54 @@ class PrintServerUI(ctk.CTk):
             self.log("----------------------------------")
 
             content_to_print = None
-            
+            payload_url = None
+
             if isinstance(payload, dict):
-                if 'content' in payload:
-                    content_to_print = payload['content']
-                elif 'data' in payload:
-                    content_to_print = payload['data']
-                else:
-                    content_to_print = payload.get('message', '')
+                payload_url = payload.get('payload_url')
+
+            if payload_url:
+                self.log(f"Fetching print payload from server: {payload_url}")
+                import urllib.request
+                import urllib.error
+                try:
+                    req = urllib.request.Request(
+                        payload_url, 
+                        headers={'User-Agent': 'RMS-Print-Server/2.0'}
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        response_bytes = response.read()
+                    
+                    # Try to parse the response as JSON. It could be {"content": "..."}
+                    try:
+                        resp_json = json.loads(response_bytes.decode('utf-8'))
+                        if isinstance(resp_json, dict):
+                            if 'content' in resp_json:
+                                content_to_print = resp_json['content']
+                            elif 'data' in resp_json:
+                                content_to_print = resp_json['data']
+                            else:
+                                content_to_print = resp_json.get('message', '')
+                        else:
+                            content_to_print = resp_json
+                    except Exception:
+                        # Fallback to the raw response bytes if it's not valid JSON
+                        content_to_print = response_bytes
+
+                    self.log(f"Successfully fetched print job payload ({len(response_bytes)} bytes).")
+                except urllib.error.URLError as e:
+                    self.log(f"Error fetching payload from server: {e}")
+                    return
+                except Exception as e:
+                    self.log(f"Unexpected error fetching payload: {e}")
+                    return
+            else:
+                if isinstance(payload, dict):
+                    if 'content' in payload:
+                        content_to_print = payload['content']
+                    elif 'data' in payload:
+                        content_to_print = payload['data']
+                    else:
+                        content_to_print = payload.get('message', '')
 
             if content_to_print:
                 try:
@@ -457,12 +503,12 @@ class PrintServerUI(ctk.CTk):
                     content_to_print = decoded
                     
                     readable_text = ''.join(chr(b) if 32 <= b <= 126 or b == 10 else '' for b in decoded)
-                    self.log(f"Received print job via Pusher ({len(decoded)} bytes)")
+                    self.log(f"Received print job ({len(decoded)} bytes)")
                     self.log(f"--- Decoded Data Preview ---\n{readable_text.strip()}\n----------------------------")
                 except:
                     if isinstance(content_to_print, str):
                         content_to_print = content_to_print.encode('utf-8')
-                    self.log(f"Received print job via Pusher ({len(content_to_print)} bytes)")
+                    self.log(f"Received print job ({len(content_to_print)} bytes)")
                 
                 # Append buzzer command if enabled
                 if self.buzzer_enabled.get():

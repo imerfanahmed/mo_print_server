@@ -44,19 +44,14 @@ def get_buzzer_command():
 
 def normalize_encoding(raw_bytes):
     """
-    Converts UTF-8 encoded ESC/POS bytes to Windows-1252 (cp1252).
-    Thermal printers use single-byte code pages. UTF-8 multi-byte characters
-    like the GBP sign (0xC2 0xA3) would otherwise print as two wrong characters
-    (e.g. A-circumflex + £). This converts them to the correct single byte.
-    Also prepends ESC t 19 to tell the printer to use Windows-1252 code page.
+    Prepends ESC t 0 (PC437 code page selection) to the ESC/POS byte stream.
+    The PHP server already generates bytes in PC437 encoding where
+    £ = 0x9C, € = 0xEE, etc. We just need to ensure the printer is
+    explicitly in PC437 mode before receiving the data.
+    No byte conversion is performed — the content is passed through unchanged.
     """
-    ESC_SELECT_CODEPAGE_CP1252 = b'\x1b\x74\x13'  # ESC t 19 = Windows-1252
-    try:
-        text = raw_bytes.decode('utf-8', errors='replace')
-        converted = text.encode('cp1252', errors='replace')
-        return ESC_SELECT_CODEPAGE_CP1252 + converted
-    except Exception:
-        return raw_bytes  # fallback: send as-is if conversion fails
+    ESC_SELECT_CODEPAGE_PC437 = b'\x1b\x74\x00'  # ESC t 0 = PC437
+    return ESC_SELECT_CODEPAGE_PC437 + raw_bytes
 
 # --- ESC/POS Test Sheet Generator ---
 

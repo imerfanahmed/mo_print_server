@@ -1,4 +1,6 @@
 customtkinter
 pywin32; sys_platform == 'win32'
 pysher
+Pillow
+pystray
 pyinstaller

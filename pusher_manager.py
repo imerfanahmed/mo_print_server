@@ -5,6 +5,7 @@ import urllib.request
 import urllib.error
 import printer
 import threading
+import config
 
 class PusherManager:
     def __init__(self, log_callback, status_callback, print_routing_callback, buzzer_enabled_callback):
@@ -72,18 +73,41 @@ class PusherManager:
             except:
                 beep_count = 1
 
-            self.log_callback(f"Playing PC hardware beep alert ({beep_count} times)...")
+            self.log_callback(f"Playing beep alert ({beep_count} times)...")
 
             def beep_worker():
-                try:
+                import time
+                import os
+                import ctypes
+
+                beep_path = os.path.join(config.get_base_path(), "beep.mp3")
+
+                def play_mp3_once(path):
+                    """Play an MP3 using Windows MCI — no extra dependencies."""
+                    winmm = ctypes.windll.winmm
+                    safe_path = str(path).replace('/', '\\')
+                    winmm.mciSendStringW(f'open "{safe_path}" type mpegvideo alias beep_snd', None, 0, None)
+                    winmm.mciSendStringW('play beep_snd wait', None, 0, None)
+                    winmm.mciSendStringW('close beep_snd', None, 0, None)
+
+                def play_fallback():
                     import winsound
-                    import time
-                    for _ in range(beep_count):
-                        # Play a pleasant notification beep (1200Hz frequency for 180 milliseconds)
-                        winsound.Beep(1200, 180)
-                        time.sleep(0.08)
-                except Exception as e:
-                    self.log_callback(f"Error playing PC hardware beep: {e}")
+                    winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+
+                for _ in range(beep_count):
+                    try:
+                        if os.path.isfile(beep_path):
+                            play_mp3_once(beep_path)
+                        else:
+                            self.log_callback(f"beep.mp3 not found at {beep_path}, using system beep.")
+                            play_fallback()
+                    except Exception as e:
+                        self.log_callback(f"Error playing beep: {e}")
+                        try:
+                            play_fallback()
+                        except:
+                            pass
+                    time.sleep(0.2)
 
             threading.Thread(target=beep_worker, daemon=True).start()
 

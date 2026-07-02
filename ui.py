@@ -87,11 +87,29 @@ class PrintServerUI(ctk.CTk):
             buzzer_enabled_callback=lambda: self.buzzer_enabled.get()
         )
 
+        # Caller ID Server Config & State
+        self.webserver = None
+        self.webserver_enabled = ctk.BooleanVar(value=True)
+        self.webserver_port = ctk.StringVar(value="8000")
+        try:
+            caller_id_config_path = config.get_config_path("caller_id_config.json")
+            if os.path.exists(caller_id_config_path):
+                with open(caller_id_config_path, "r") as f:
+                    caller_id_data = json.load(f)
+                    self.webserver_enabled.set(caller_id_data.get("enabled", True))
+                    self.webserver_port.set(str(caller_id_data.get("port", "8000")))
+        except Exception:
+            pass
+
         self.setup_ui()
         
         # Connect to Pusher if config exists
         if self.pusher_config.get("key"):
             self.connect_to_pusher()
+
+        # Start Caller ID Webserver if enabled
+        if self.webserver_enabled.get():
+            self.start_caller_id_server()
 
     def setup_ui(self):
         # Setup Tabs
@@ -100,6 +118,7 @@ class PrintServerUI(ctk.CTk):
 
         self.tab_config = self.tabview.add("Print Server Config")
         self.tab_test = self.tabview.add("Test Print")
+        self.tab_caller_id = self.tabview.add("Caller ID Server")
 
         # --- Print Server Config Tab ---
         ctk.CTkLabel(self.tab_config, text="Cloud Connection (Pusher)", font=("Arial", 16, "bold")).pack(pady=(10, 5))
@@ -154,6 +173,34 @@ class PrintServerUI(ctk.CTk):
         self.test_btn.pack(pady=15)
         
         self.refresh_inputs()
+
+        # --- Caller ID Server Tab ---
+        ctk.CTkLabel(self.tab_caller_id, text="Caller ID HTTP Webserver Settings", font=("Arial", 16, "bold")).pack(pady=(10, 5))
+        
+        self.caller_id_frame = ctk.CTkFrame(self.tab_caller_id)
+        self.caller_id_frame.pack(pady=5, padx=20, fill="x")
+        
+        self.caller_id_enabled_chk = ctk.CTkCheckBox(self.caller_id_frame, text="Enable Caller ID Webserver", variable=self.webserver_enabled)
+        self.caller_id_enabled_chk.pack(anchor="w", padx=15, pady=10)
+        
+        port_frame = ctk.CTkFrame(self.caller_id_frame, fg_color="transparent")
+        port_frame.pack(fill="x", padx=15, pady=5)
+        ctk.CTkLabel(port_frame, text="Webserver Port:").pack(side="left", padx=5)
+        self.port_entry_caller_id = ctk.CTkEntry(port_frame, textvariable=self.webserver_port, width=80)
+        self.port_entry_caller_id.pack(side="left", padx=5)
+
+        url_frame = ctk.CTkFrame(self.caller_id_frame, fg_color="transparent")
+        url_frame.pack(fill="x", padx=15, pady=5)
+        ctk.CTkLabel(url_frame, text="Webhook URL:").pack(side="left", padx=5)
+        self.webhook_url_var = ctk.StringVar()
+        self.update_webhook_url_display()
+        self.url_entry = ctk.CTkEntry(url_frame, textvariable=self.webhook_url_var, width=320, state="readonly")
+        self.url_entry.pack(side="left", padx=5, fill="x", expand=True)
+        self.copy_btn = ctk.CTkButton(url_frame, text="Copy URL", width=70, command=self.copy_webhook_url)
+        self.copy_btn.pack(side="left", padx=5)
+        
+        self.save_restart_server_btn = ctk.CTkButton(self.tab_caller_id, text="Save & Restart Server", command=self.save_and_restart_caller_id_server)
+        self.save_restart_server_btn.pack(pady=10)
 
         # --- Shared Log Window ---
         ctk.CTkLabel(self, text="Activity Log", font=("Arial", 14, "bold")).pack(pady=(10, 0))
@@ -354,7 +401,67 @@ class PrintServerUI(ctk.CTk):
         self.tray_icon = None
         self.after(0, self.deiconify)
 
+    def start_caller_id_server(self):
+        try:
+            port = int(self.webserver_port.get().strip())
+        except ValueError:
+            self.log("Invalid Caller ID Server port. Defaulting to 8000.")
+            port = 8000
+            self.webserver_port.set("8000")
+
+        from caller_id_server import CallerIDWebServer
+        self.webserver = CallerIDWebServer(
+            port=port,
+            caller_id_callback=self.handle_incoming_call,
+            log_callback=self.log
+        )
+        self.webserver.start()
+
+    def handle_incoming_call(self, tel):
+        self.log(f"Caller ID Webserver: Incoming call detected for {tel}")
+        threading.Thread(target=self.pusher_manager.trigger_call_event, args=(tel,), daemon=True).start()
+
+    def update_webhook_url_display(self):
+        port_val = self.webserver_port.get().strip() or "8000"
+        self.webhook_url_var.set(f"http://localhost:{port_val}/incoming_call")
+
+    def copy_webhook_url(self):
+        url = self.webhook_url_var.get()
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        self.update()
+        self.log(f"Copied Caller ID URL: {url}")
+
+    def save_and_restart_caller_id_server(self):
+        # Save configuration
+        config_data = {
+            "enabled": self.webserver_enabled.get(),
+            "port": self.webserver_port.get().strip()
+        }
+        try:
+            caller_id_config_path = config.get_config_path("caller_id_config.json")
+            with open(caller_id_config_path, "w") as f:
+                json.dump(config_data, f)
+            self.log("Caller ID server configuration saved.")
+        except Exception as e:
+            self.log(f"Error saving Caller ID server config: {e}")
+
+        self.update_webhook_url_display()
+
+        # Stop existing server if running
+        if self.webserver:
+            self.webserver.stop()
+            self.webserver = None
+
+        # Start new server if enabled
+        if self.webserver_enabled.get():
+            self.start_caller_id_server()
+        else:
+            self.log("Caller ID Webserver has been disabled.")
+
     def quit_window(self, icon, item):
         icon.stop()
         self.pusher_manager.disconnect()
+        if self.webserver:
+            self.webserver.stop()
         self.destroy()

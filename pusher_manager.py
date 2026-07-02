@@ -314,3 +314,75 @@ class PusherManager:
 
         except Exception as e:
             self.log_callback(f"Error processing Pusher event: {e}")
+
+    def trigger_call_event(self, tel):
+        import os
+        try:
+            config_path = config.get_config_path("pusher_config.json")
+            if not os.path.exists(config_path):
+                self.log_callback("Pusher configuration file not found. Cannot trigger call event.")
+                return False
+            with open(config_path, "r") as f:
+                pusher_config = json.load(f)
+        except Exception as e:
+            self.log_callback(f"Failed to read pusher config: {e}")
+            return False
+
+        app_id = pusher_config.get("app_id")
+        key = pusher_config.get("key")
+        secret = pusher_config.get("secret")
+        cluster = pusher_config.get("cluster", "eu")
+        channel = pusher_config.get("channel", "print-channel")
+
+        if not all([app_id, key, secret, channel]):
+            self.log_callback("Missing Pusher credentials in config. Cannot trigger call event.")
+            return False
+
+        import time
+        import hmac
+        import hashlib
+        import urllib.request
+        import urllib.error
+
+        event_name = 'call'
+        data_dict = {
+            'tel': tel
+        }
+
+        try:
+            body = json.dumps({
+                "name": event_name,
+                "channels": [channel],
+                "data": json.dumps(data_dict)
+            })
+
+            path = f"/apps/{app_id}/events"
+            timestamp = str(int(time.time()))
+            auth_version = "1.0"
+            content_md5 = hashlib.md5(body.encode('utf-8')).hexdigest()
+
+            string_to_sign = f"POST\n{path}\nauth_key={key}&auth_timestamp={timestamp}&auth_version={auth_version}&body_md5={content_md5}"
+            signature = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+
+            url = f"https://api-{cluster}.pusher.com{path}?auth_key={key}&auth_timestamp={timestamp}&auth_version={auth_version}&body_md5={content_md5}&auth_signature={signature}"
+
+            self.log_callback(f"Triggering call event to Pusher channel '{channel}' for number: {tel}")
+
+            req = urllib.request.Request(
+                url,
+                data=body.encode('utf-8'),
+                headers={"Content-Type": "application/json"}
+            )
+            
+            import ssl
+            ssl_context = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=10, context=ssl_context) as response:
+                response.read()
+            self.log_callback("Pusher call event triggered successfully.")
+            return True
+        except urllib.error.HTTPError as e:
+            self.log_callback(f"HTTP Error triggering call event: {e.code} - {e.read().decode('utf-8')}")
+            return False
+        except Exception as e:
+            self.log_callback(f"Error triggering call event to Pusher: {e}")
+            return False
